@@ -9,11 +9,13 @@
 #include <time.h>
 LGFX tft;
 Preferences prefs;
-constexpr int W=320,H=240,MAX_PROJECTS=40;
+constexpr int W=320,H=240,MAX_PROJECTS=80;
 #include "display.inc"
 struct Project { char name[72]; int rank,stage; };
 struct Snapshot { Project rows[MAX_PROJECTS]; int count; char forecast[80]; char checked[40]; bool ok; };
 static Snapshot current{}, incoming{};
+static constexpr uint32_t RETRY_MS=60000;
+static bool truncated=false;
 static QueueHandle_t requests, results;
 static lv_obj_t *summary,*status,*list,*forecast;
 static uint32_t lastRequest=0;
@@ -35,27 +37,34 @@ static void sourceText(){
   setenv("TZ","UTC0",1);tzset();time_t stamp=mktime(&utc);
   setenv("TZ","CET-1CEST,M3.5.0,M10.5.0/3",1);tzset();struct tm local{};
   localtime_r(&stamp,&local);strftime(buf,sizeof(buf),"%d/%m %H:%M",&local);
-  lv_label_set_text_fmt(status,"%s: %s",cached?"Cache":failed?"Echec - source":"Source",buf);
+  lv_label_set_text_fmt(status,"%s: %s",failed?"Echec/cache":cached?"Cache":"Source",buf);
  }else lv_label_set_text_fmt(status,"%s: %.16s",cached?"Cache":"Source",current.checked);
 }
 static void loadCache(){
  if(!prefs.begin("gta6",true))return;
- if(prefs.getBytesLength("snapshot1")==sizeof(current)){
-  prefs.getBytes("snapshot1",&current,sizeof(current));
-  if(!current.ok||current.count<1||current.count>MAX_PROJECTS)current=Snapshot{};
-  else {cached=true;current.checked[sizeof(current.checked)-1]=0;current.forecast[sizeof(current.forecast)-1]=0;for(int i=0;i<current.count;i++){current.rows[i].name[71]=0;if(current.rows[i].stage<1||current.rows[i].stage>7){current=Snapshot{};cached=false;break;}}}
+ if(prefs.getBytesLength("snapshot2")==sizeof(current)){
+  prefs.getBytes("snapshot2",&current,sizeof(current));
+  if(!current.ok||current.count<1||current.count>MAX_PROJECTS)memset(&current,0,sizeof(current));
+  else {cached=true;current.checked[sizeof(current.checked)-1]=0;current.forecast[sizeof(current.forecast)-1]=0;for(int i=0;i<current.count;i++){current.rows[i].name[71]=0;if(current.rows[i].stage<1||current.rows[i].stage>7){memset(&current,0,sizeof(current));cached=false;break;}}}
+ }else if(prefs.getBytesLength("snapshot1")==sizeof(Project)*40+sizeof(int)+80+40+4){
+  struct Legacy { Project rows[40]; int count; char forecast[80]; char checked[40]; bool ok; }; Legacy old;
+  if(prefs.getBytes("snapshot1",&old,sizeof(old))==sizeof(old)&&old.ok&&old.count>0&&old.count<=40){
+   current.count=old.count; current.ok=true; memcpy(current.rows,old.rows,sizeof(old.rows)); memcpy(current.forecast,old.forecast,80); memcpy(current.checked,old.checked,40); current.forecast[79]=0; current.checked[39]=0; cached=true;
+   for(int i=0;i<current.count;i++){current.rows[i].name[71]=0;if(current.rows[i].stage<1||current.rows[i].stage>7){current.count=0;cached=false;break;}}
+  }
  }prefs.end();
 }
-static void saveCache(){if(prefs.begin("gta6",false)){prefs.putBytes("snapshot1",&current,sizeof(current));prefs.end();}}
+static void saveCache(){if(prefs.begin("gta6",false)){prefs.putBytes("snapshot2",&current,sizeof(current));prefs.end();}}
 
 static lv_obj_t *rows[PER_PAGE], *ranks[PER_PAGE], *names[PER_PAGE], *levels[PER_PAGE], *segments[PER_PAGE][7];
 static String clean(String s){ String out; bool tag=false; for(unsigned i=0;i<s.length();i++){char c=s[i];if(c=='<')tag=true;else if(c=='>')tag=false;else if(!tag)out+=c;} out.replace("&amp;","&");out.replace("&nbsp;"," ");out.replace("&#x27;","'");out.trim();return out; }
 static String between(const String& s,const char* start,const char* end){int a=s.indexOf(start);if(a<0)return "";a+=strlen(start);int b=s.indexOf(end,a);return b<0?String():s.substring(a,b);}
 static bool fetch(Snapshot &o){
- o=Snapshot{}; if(WiFi.status()!=WL_CONNECTED)return false;
+ memset(&o,0,sizeof(o)); truncated=false; if(WiFi.status()!=WL_CONNECTED){Serial.println("WiFi disconnected");return false;}
  WiFiClientSecure client; client.setInsecure(); // Public data, no certificate validation in V1
  HTTPClient http;http.useHTTP10(true);http.setConnectTimeout(8000);http.setTimeout(10000);
  if(!http.begin(client,TRACKER_URL))return false;
+ http.addHeader("Cache-Control","no-cache");
  int code=http.GET();Serial.printf("HTTP %d\n",code);if(code!=200){http.end();return false;}
  auto &stream=http.getStream(); String line,row;line.reserve(4096);row.reserve(4096);bool inRow=false,done=false,overflow=false;uint32_t last=millis(),start=last;
  int remaining=http.getSize();
@@ -68,13 +77,13 @@ static bool fetch(Snapshot &o){
    if(line.indexOf("<li class=\"board__row\"")>=0){inRow=true;row="";}
    if(inRow){if(row.length()+line.length()>12000){inRow=false;http.end();return false;}row+=line;if(line.indexOf("</li>")>=0){
     String rank=between(row,"aria-label=\"Position ","\"");String name=clean(between(row,"<h3 class=\"t-card\">","</h3>"));String stage=between(row,"aria-label=\"Stage "," of 7");int n=stage.toInt();
-    if(!rank.length()||!name.length()||n<1||n>7||o.count>=MAX_PROJECTS){http.end();return false;}auto &p=o.rows[o.count++];p.rank=rank.toInt();p.stage=n;strlcpy(p.name,name.c_str(),sizeof(p.name));inRow=false;}}
+    if(!rank.length()||!name.length()||n<1||n>7){http.end();return false;}if(o.count<MAX_PROJECTS){auto &p=o.rows[o.count++];p.rank=rank.toInt();p.stage=n;strlcpy(p.name,name.c_str(),sizeof(p.name));}else truncated=true;inRow=false;}}
    if(o.count&&!inRow&&line.indexOf("</ol>")>=0){done=true;break;}
   }else if(inRow){http.end();return false;}line="";overflow=false;
  }
- http.end();return done&&o.count>0;
+ http.end();Serial.printf("HTML: rows=%d complete=%d truncated=%d source=%s\n",o.count,done,truncated,o.checked);return done&&o.count>0&&o.checked[0];
 }
-static void network(void*){uint8_t cmd;for(;;){if(xQueueReceive(requests,&cmd,portMAX_DELAY)){incoming.ok=fetch(incoming);xQueueSend(results,&incoming,portMAX_DELAY);}}}
+static void network(void*){uint8_t cmd;for(;;){if(xQueueReceive(requests,&cmd,portMAX_DELAY)){incoming.ok=fetch(incoming);uint8_t ready=1;xQueueSend(results,&ready,portMAX_DELAY);}}}
 static lv_obj_t* label(lv_obj_t* p,const char* t,int x,int y,const lv_font_t* f,uint32_t color){auto l=lv_label_create(p);lv_label_set_text(l,t);lv_obj_set_pos(l,x,y);lv_obj_set_style_text_font(l,f,0);lv_obj_set_style_text_color(l,lv_color_hex(color),0);return l;}
 static void refresh(){if(busy||!networkReady||WiFi.status()!=WL_CONNECTED)return;uint8_t cmd=1;if(xQueueSend(requests,&cmd,0)==pdTRUE){busy=true;lastRequest=millis();lv_label_set_text(status,"Actualisation...");}}
 static void click(lv_event_t*){refresh();}
@@ -160,19 +169,20 @@ static void bootDraw(bool online){
  if((elapsed>=2600&&(bootResult||!networkReady))||elapsed>=12000){bootActive=false;pageAt=millis();lv_obj_invalidate(lv_screen_active());}
 }
 
-void setup(){Serial.begin(115200);pinMode(0,INPUT_PULLUP);tft.init();tft.setRotation(3);tft.setBrightness(220);prefs.begin("gta6",false);uint16_t cal[8];if(prefs.getBytesLength("cal")==sizeof(cal)&&digitalRead(0)!=LOW){prefs.getBytes("cal",cal,sizeof(cal));tft.setTouchCalibrate(cal);}else{tft.fillScreen(TFT_BLACK);tft.calibrateTouch(cal,TFT_MAGENTA,TFT_BLACK,15);prefs.putBytes("cal",cal,sizeof(cal));tft.setTouchCalibrate(cal);}prefs.end();
+void setup(){Serial.begin(115200);pinMode(0,INPUT_PULLUP);tft.init();tft.setRotation(1);tft.setBrightness(220);prefs.begin("gta6",false);uint16_t cal[8];if(prefs.getBytesLength("cal")==sizeof(cal)&&digitalRead(0)!=LOW){prefs.getBytes("cal",cal,sizeof(cal));tft.setTouchCalibrate(cal);}else{tft.fillScreen(TFT_BLACK);tft.calibrateTouch(cal,TFT_MAGENTA,TFT_BLACK,15);prefs.putBytes("cal",cal,sizeof(cal));tft.setTouchCalibrate(cal);}prefs.end();
  bootStart();
  lv_init();lv_tick_set_cb(tick_cb);auto d=lv_display_create(W,H);lv_display_set_color_format(d,LV_COLOR_FORMAT_RGB565);lv_display_set_flush_cb(d,flush_cb);lv_display_set_buffers(d,drawBuf,nullptr,sizeof(drawBuf),LV_DISPLAY_RENDER_MODE_PARTIAL);auto in=lv_indev_create();lv_indev_set_type(in,LV_INDEV_TYPE_POINTER);lv_indev_set_read_cb(in,touch_cb);
  auto root=lv_screen_active();lv_obj_set_style_bg_color(root,lv_color_hex(0x10121c),0);lv_obj_remove_flag(root,LV_OBJ_FLAG_SCROLLABLE);label(root,"GTA VI | PC RACE",10,3,&lv_font_montserrat_24,0xf49ccd);summary=label(root,"En attente des donnees",10,32,&lv_font_montserrat_12,0xffb875);forecast=label(root,"Est. site : --",10,53,&lv_font_montserrat_10,0xffffff);lv_obj_set_width(forecast,300);lv_label_set_long_mode(forecast,LV_LABEL_LONG_DOT);list=lv_obj_create(root);lv_obj_set_pos(list,8,72);lv_obj_set_size(list,304,126);lv_obj_set_style_bg_opa(list,LV_OPA_TRANSP,0);lv_obj_set_style_border_width(list,0,0);lv_obj_set_style_pad_all(list,0,0);lv_obj_remove_flag(list,LV_OBJ_FLAG_SCROLLABLE);lv_obj_add_flag(list,LV_OBJ_FLAG_CLICKABLE);lv_obj_add_event_cb(list,navigate,LV_EVENT_CLICKED,nullptr);buildRows();pageLabel=label(root,"Page 1/1",8,201,&lv_font_montserrat_12,0xf49ccd);status=label(root,"Connexion Wi-Fi...",8,218,&lv_font_montserrat_10,0xb5b8cc);lv_obj_set_width(status,220);lv_label_set_long_mode(status,LV_LABEL_LONG_DOT);auto btn=lv_button_create(root);lv_obj_set_pos(btn,233,207);lv_obj_set_size(btn,80,30);lv_obj_set_style_bg_color(btn,lv_color_hex(0x713c65),0);auto txt=lv_label_create(btn);lv_label_set_text(txt,"Refresh");lv_obj_set_style_text_font(txt,&lv_font_montserrat_12,0);lv_obj_center(txt);lv_obj_add_event_cb(btn,click,LV_EVENT_CLICKED,nullptr);
- wifiLabel=label(root,"WiFi",268,35,&lv_font_montserrat_10,0xff6666);countdown=label(root,"--:--",135,202,&lv_font_montserrat_10,0xb5b8cc);loadCache();if(current.count){render();sourceText();}requests=xQueueCreate(1,sizeof(uint8_t));results=xQueueCreate(1,sizeof(Snapshot));if(!requests||!results||xTaskCreate(network,"tracker",12288,nullptr,1,nullptr)!=pdPASS){lv_label_set_text(status,"Erreur allocation reseau");return;}networkReady=true;WiFi.mode(WIFI_STA);WiFi.setAutoReconnect(true);WiFi.begin(WIFI_SSID,WIFI_PASS);
+ wifiLabel=label(root,"WiFi",268,35,&lv_font_montserrat_10,0xff6666);countdown=label(root,"--:--",135,202,&lv_font_montserrat_10,0xb5b8cc);loadCache();if(current.count){render();sourceText();}requests=xQueueCreate(1,sizeof(uint8_t));results=xQueueCreate(1,sizeof(uint8_t));if(!requests||!results||xTaskCreate(network,"tracker",12288,nullptr,1,nullptr)!=pdPASS){lv_label_set_text(status,"Erreur allocation reseau");return;}networkReady=true;WiFi.mode(WIFI_STA);WiFi.setAutoReconnect(true);WiFi.begin(WIFI_SSID,WIFI_PASS);
 }
 void loop(){
  if(!bootActive)lv_timer_handler();static bool wasOnline=false;bool online=WiFi.status()==WL_CONNECTED;
  if(networkReady){
   if(online&&!wasOnline)refresh();
-  if(online&&!busy&&millis()-lastRequest>=REFRESH_MS)refresh();
-  static Snapshot received;
-  if(xQueueReceive(results,&received,0)==pdTRUE){
+  if(online&&!busy&&millis()-lastRequest>=(failed?RETRY_MS:REFRESH_MS))refresh();
+  uint8_t ready;
+  if(xQueueReceive(results,&ready,0)==pdTRUE){
+   const Snapshot &received=incoming;
    busy=false;failed=!received.ok;bootResult=true;
    if(received.ok){
     memset(progressed,0,sizeof(progressed));
@@ -186,7 +196,7 @@ void loop(){
  wasOnline=online;
  static uint32_t uiAt=0;static bool first=true;
  if(first||millis()-uiAt>=500){first=false;uiAt=millis();lv_obj_set_style_text_color(wifiLabel,lv_color_hex(online?0x55dd88:0xff6666),0);
-  if(busy)lv_label_set_text(countdown,"MAJ...");else if(!online)lv_label_set_text(countdown,"Hors ligne");else{uint32_t elapsed=millis()-lastRequest;uint32_t sec=elapsed>=REFRESH_MS?0:(REFRESH_MS-elapsed+999)/1000;lv_label_set_text_fmt(countdown,"MAJ %02u:%02u",(unsigned)(sec/60),(unsigned)(sec%60));}}
+  if(busy)lv_label_set_text(countdown,"MAJ...");else if(!online)lv_label_set_text(countdown,"Hors ligne");else{uint32_t elapsed=millis()-lastRequest;uint32_t interval=failed?RETRY_MS:REFRESH_MS;uint32_t sec=elapsed>=interval?0:(interval-elapsed+999)/1000;lv_label_set_text_fmt(countdown,"MAJ %02u:%02u",(unsigned)(sec/60),(unsigned)(sec%60));}}
  if(bootActive)bootDraw(online);
  if(!bootActive&&!paused&&current.count&&millis()-pageAt>=PAGE_MS){page=(page+1)%pages();pageAt=millis();render();}delay(5);
 }
