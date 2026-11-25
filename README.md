@@ -6,12 +6,14 @@
 
 *Photo of an earlier working prototype; the current release adds automatic pagination and an animated boot screen.*
 
-## Features — v1.4.1
+## Features — v1.4.3
 
 - Animated sunset-themed boot screen with palms and a loading bar.
 - Six ranked projects per page, automatically cycling every 10 seconds.
 - Touch left/right to change pages, center to pause or resume.
-- Automatic data refresh every 15 minutes and manual Refresh button.
+- Automatic data refresh every 15 minutes, retry after 1 minute on failure while online, and manual Refresh button.
+- Up to 80 ranked entries, with truncation rather than failure above that limit.
+- HTTP and HTML parsing diagnostics via the serial monitor (115200 baud).
 - Wi-Fi status, refresh countdown, and source timestamp in Belgian local time (including daylight saving time).
 - Green highlight for projects whose stage has increased.
 - Last successful standings cached in ESP32 flash for offline viewing.
@@ -19,7 +21,7 @@
 
 ## Hardware
 
-ESP32-2432S028R (2.8-inch CYD), 320 × 240 landscape display, ILI9341 LCD and XPT2046 resistive touch. Other CYD variants may need different pin mappings or display settings in `include/lgfx_cyd.h`.
+ESP32-2432S028R (2.8-inch CYD), 320 × 240 landscape display (180° rotation relative to the original release), ILI9341 LCD and XPT2046 resistive touch. Other CYD variants may need different pin mappings or display settings in `include/lgfx_cyd.h`.
 
 ## Installation (PlatformIO)
 
@@ -51,7 +53,7 @@ If upload fails, check the USB cable, serial port and driver. To recalibrate, ho
 
 ## Data and limitations
 
-Data comes from the public HTML of [GTA6 PC Race](https://vuyp.github.io/gta6-pc-race/#standings), maintained at [vuyp/gta6-pc-race](https://github.com/vuyp/gta6-pc-race). This project is an independent display client, not the source of the standings. The site estimates and stages are unofficial; 7/7 is not independent proof that a playable PC release exists. The HTML parser depends on the upstream layout and supports up to 40 ranked entries. If the layout changes or the limit is exceeded, updates may fail. The firmware retains the last valid snapshot when possible.
+Data comes from the public HTML of [GTA6 PC Race](https://vuyp.github.io/gta6-pc-race/#standings), maintained at [vuyp/gta6-pc-race](https://github.com/vuyp/gta6-pc-race). This project is an independent display client, not the source of the standings. The site estimates and stages are unofficial; 7/7 is not independent proof that a playable PC release exists. The HTML parser depends on the upstream layout and supports up to 80 ranked entries. Additional entries are omitted. If the layout changes, updates may fail. The firmware retains the last valid snapshot when possible.
 
 HTTPS currently uses `setInsecure()` (no server certificate verification). This is a prototype for public data only; network responses can be tampered with. Do not use it for sensitive data. Wi-Fi credentials are compiled into the firmware; do not distribute a binary built with your real credentials.
 
@@ -64,3 +66,10 @@ HTTPS currently uses `setInsecure()` (no server certificate verification). This 
 ## License
 
 MIT for the original tracker code, subject to the repository owner's approval before publication. Third-party components retain their own licenses.
+
+## Release notes — v1.4.3
+
+- Increased the standings capacity from 40 to 80 entries.
+- Added retry handling, HTTP no-cache request header and serial diagnostics.
+- Retained compatibility with the previous 40-entry cache.
+- Includes the 180° display rotation and WELCOME TO LEONIDA boot screen.
